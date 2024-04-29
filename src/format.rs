@@ -137,6 +137,7 @@ pub type StructuredData = HashMap<String, HashMap<String, String>>;
 pub struct Formatter5424 {
     pub facility: Facility,
     pub hostname: Option<String>,
+    /// Called APP-NAME in RFC5424
     pub process: String,
     pub pid: u32,
 }
@@ -150,13 +151,86 @@ impl Formatter5424 {
             for (id, params) in &data {
                 res = res + "[" + id;
                 for (name, value) in params {
-                    res = res + " " + name + "=\"" + value + "\"";
+                    res = res
+                        + " "
+                        + name
+                        + "=\""
+                        + &escape_structure_data_param_value(&value)
+                        + "\"";
                 }
                 res += "]";
             }
 
             res
         }
+    }
+}
+
+impl<T: Display> LogFormat<(Option<String>, StructuredData, T)> for Formatter5424 {
+    fn format<W: Write>(
+        &self,
+        w: &mut W,
+        severity: Severity,
+        log_message: (Option<String>, StructuredData, T),
+    ) -> Result<()> {
+        let (message_id, data, message) = log_message;
+
+        // XXX: seems a lot of effort per-call, we could do this via a wrapper type instead
+        // So the caller could do this once and pass it in
+        let message_id = message_id
+            .unwrap_or_else(|| NILL_VALUE.to_owned())
+            .chars()
+            .filter(is_us_print_ascii)
+            .take(32)
+            .collect::<String>();
+
+        // XXX: seems a lot of effort per-call, we could do this once when Formatter5424 is created
+        // but that would require breaking the API
+        let process = self
+            .process
+            .chars()
+            .filter(is_us_print_ascii)
+            .take(48)
+            .collect::<String>();
+
+        // Guard against sub-second precision over 6 digits per rfc5424 section 6
+        let timestamp = time::OffsetDateTime::now_utc();
+        // SAFETY: timestamp range is enforced, so this will never fail
+        let timestamp = timestamp
+            // Removing significant figures beyond 6 digits (nanoseconds to microseconds)
+            .replace_nanosecond(timestamp.microsecond())
+            .unwrap();
+
+        // XXX: seems a lot of effort per-call, we could do this once when Formatter5424 is created
+        // but that would require breaking the API
+
+        // Enforce hostname is between ascii codes 33 and 128, and a maximum of 255 character
+        // according to rfc5424 section 6
+        let hostname = if let Some(hostname) = self.hostname.as_ref() {
+            hostname
+                .chars()
+                .filter(is_us_print_ascii)
+                .take(255)
+                .collect::<String>()
+        } else {
+            "localhost".to_owned()
+        };
+
+        write!(
+            w,
+            "<{}>1 {} {} {} {} {} {} {}", // v1
+            encode_priority(severity, self.facility),
+            timestamp
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            hostname,
+            process,
+            self.pid,
+            message_id,
+            self.format_5424_structured_data(data),
+            message
+        )
+        .chain_err(|| ErrorKind::Format)
     }
 }
 
@@ -167,26 +241,17 @@ impl<T: Display> LogFormat<(u32, StructuredData, T)> for Formatter5424 {
         severity: Severity,
         log_message: (u32, StructuredData, T),
     ) -> Result<()> {
-        let (message_id, data, message) = log_message;
-
-        write!(
+        // Slight bit more overhead, but we can reuse the other implementation
+        LogFormat::<(Option<String>, StructuredData, T)>::format(
+            self,
             w,
-            "<{}>1 {} {} {} {} {} {} {}", // v1
-            encode_priority(severity, self.facility),
-            time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-            self.hostname
-                .as_ref()
-                .map(|x| &x[..])
-                .unwrap_or("localhost"),
-            self.process,
-            self.pid,
-            message_id,
-            self.format_5424_structured_data(data),
-            message
+            severity,
+            (
+                Some(log_message.0.to_string()),
+                log_message.1,
+                log_message.2,
+            ),
         )
-        .chain_err(|| ErrorKind::Format)
     }
 }
 
@@ -221,9 +286,26 @@ impl Default for Formatter5424 {
     }
 }
 
+fn escape_structure_data_param_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(']', "\\]")
+}
+
+/// Checks if a character is printable US ASCII
+/// Defined by rfc5424 as between 33 and 126
+fn is_us_print_ascii(c: &char) -> bool {
+    33 <= *c as u32 && *c as u32 <= 126
+}
+
 fn encode_priority(severity: Severity, facility: Facility) -> Priority {
     facility as u8 | severity as u8
 }
+
+/// The value to use when a field is not present
+/// Defined by rfc5424 as a single hyphen
+const NILL_VALUE: &str = "-";
 
 #[cfg(unix)]
 // On unix platforms, time::OffsetDateTime::now_local always returns an error so use UTC instead
@@ -237,42 +319,94 @@ fn now_local() -> std::result::Result<time::OffsetDateTime, time::error::Indeter
     time::OffsetDateTime::now_local()
 }
 
-#[test]
-fn test_formatter3164_defaults() {
-    let d = Formatter3164::default();
+#[cfg(test)]
+mod test {
+    use super::*;
 
-    // `Facility` doesn't implement `PartialEq`, so we use a `match` instead.
-    assert!(match d.facility {
-        Facility::LOG_USER => true,
-        _ => false,
-    });
+    #[test]
+    fn space_is_out_of_us_printable_ascii() {
+        assert!(!is_us_print_ascii(&' '));
+    }
 
-    assert!(match &d.hostname {
-        Some(hostname) => !hostname.is_empty(),
-        None => false,
-    });
+    #[test]
+    fn ascii_chars_are_in_range() {
+        for i in 33..=126 {
+            assert!(is_us_print_ascii(&char::from(i)));
+        }
+        for i in 'a'..'z' {
+            assert!(is_us_print_ascii(&i));
+        }
+        for i in 'A'..'Z' {
+            assert!(is_us_print_ascii(&i));
+        }
+    }
 
-    assert!(!d.process.is_empty());
+    #[test]
+    fn ascii_thirty_two_out_of_range() {
+        assert!(!is_us_print_ascii(&char::from(32)));
+    }
 
-    // Can't really make any assertions about the pid.
-}
+    #[test]
+    fn ascii_one_hundred_twenty_seven_out_of_range() {
+        assert!(!is_us_print_ascii(&char::from(127)));
+    }
 
-#[test]
-fn test_formatter5424_defaults() {
-    let d = Formatter5424::default();
+    #[test]
+    fn backslash_is_escaped() {
+        let string = "\\";
+        let value = escape_structure_data_param_value(string);
+        assert_eq!(value, "\\\\");
+    }
+    #[test]
+    fn quote_is_escaped() {
+        let string = "foo\"bar";
+        let value = escape_structure_data_param_value(string);
+        assert_eq!(value, "foo\\\"bar");
+    }
+    #[test]
+    fn end_bracket_is_escaped() {
+        let string = "]";
+        let value = escape_structure_data_param_value(string);
+        assert_eq!(value, "\\]");
+    }
 
-    // `Facility` doesn't implement `PartialEq`, so we use a `match` instead.
-    assert!(match d.facility {
-        Facility::LOG_USER => true,
-        _ => false,
-    });
+    #[test]
+    fn test_formatter3164_defaults() {
+        let d = Formatter3164::default();
 
-    assert!(match &d.hostname {
-        Some(hostname) => !hostname.is_empty(),
-        None => false,
-    });
+        // `Facility` doesn't implement `PartialEq`, so we use a `match` instead.
+        assert!(match d.facility {
+            Facility::LOG_USER => true,
+            _ => false,
+        });
 
-    assert!(!d.process.is_empty());
+        assert!(match &d.hostname {
+            Some(hostname) => !hostname.is_empty(),
+            None => false,
+        });
 
-    // Can't really make any assertions about the pid.
+        assert!(!d.process.is_empty());
+
+        // Can't really make any assertions about the pid.
+    }
+
+    #[test]
+    fn test_formatter5424_defaults() {
+        let d = Formatter5424::default();
+
+        // `Facility` doesn't implement `PartialEq`, so we use a `match` instead.
+        assert!(match d.facility {
+            Facility::LOG_USER => true,
+            _ => false,
+        });
+
+        assert!(match &d.hostname {
+            Some(hostname) => !hostname.is_empty(),
+            None => false,
+        });
+
+        assert!(!d.process.is_empty());
+
+        // Can't really make any assertions about the pid.
+    }
 }
