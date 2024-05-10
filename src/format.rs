@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Write;
+use std::str::FromStr;
 use time;
 
 use errors::*;
@@ -160,7 +161,6 @@ impl Formatter5424 {
         }
     }
 }
-
 impl<T: Display> LogFormat<(Option<String>, StructuredData, T)> for Formatter5424 {
     fn format<W: Write>(
         &self,
@@ -168,16 +168,27 @@ impl<T: Display> LogFormat<(Option<String>, StructuredData, T)> for Formatter542
         severity: Severity,
         log_message: (Option<String>, StructuredData, T),
     ) -> Result<()> {
-        let (message_id, data, message) = log_message;
-
-        // XXX: seems a lot of effort per-call, we could do this via a wrapper type instead
-        // So the caller could do this once and pass it in
+        let (message_id, structured_data, message) = log_message;
         let message_id = message_id
-            .unwrap_or_else(|| NILL_VALUE.to_owned())
-            .chars()
-            .filter(is_us_print_ascii)
-            .take(32)
-            .collect::<String>();
+            .map(|s| MessageId::from_str_lossy(&s))
+            .unwrap_or_default();
+        LogFormat::<(MessageId, StructuredData, T)>::format(
+            self,
+            w,
+            severity,
+            (message_id, structured_data, message),
+        )
+    }
+}
+
+impl<T: Display> LogFormat<(MessageId, StructuredData, T)> for Formatter5424 {
+    fn format<W: Write>(
+        &self,
+        w: &mut W,
+        severity: Severity,
+        log_message: (MessageId, StructuredData, T),
+    ) -> Result<()> {
+        let (message_id, data, message) = log_message;
 
         // Guard against sub-second precision over 6 digits per rfc5424 section 6
         let timestamp = time::OffsetDateTime::now_utc();
@@ -200,7 +211,7 @@ impl<T: Display> LogFormat<(Option<String>, StructuredData, T)> for Formatter542
                 .unwrap_or("localhost"),
             self.process,
             self.pid,
-            message_id,
+            message_id.0,
             self.format_5424_structured_data(data),
             message
         )
@@ -257,6 +268,62 @@ impl Default for Formatter5424 {
             process,
             pid,
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum MessageIdFromStrErr {
+    TooLong,
+    InvalidChar,
+}
+
+impl Display for MessageIdFromStrErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            MessageIdFromStrErr::TooLong => "Message ID too long",
+            MessageIdFromStrErr::InvalidChar => "Message ID Contains non US ASCII character",
+        };
+        f.write_str(msg)
+    }
+}
+
+/// MSGID according to RFC 5424
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
+#[repr(transparent)]
+pub struct MessageId(String);
+
+impl FromStr for MessageId {
+    type Err = MessageIdFromStrErr;
+
+    fn from_str(s: &str) -> std::prelude::v1::Result<Self, Self::Err> {
+        if s.len() > 32 {
+            Err(MessageIdFromStrErr::TooLong)
+        } else if s.chars().any(|c| !is_us_print_ascii(&c)) {
+            Err(MessageIdFromStrErr::InvalidChar)
+        } else {
+            Ok(MessageId(s.to_owned()))
+        }
+    }
+}
+
+impl MessageId {
+    pub fn nill() -> Self {
+        MessageId(NILL_VALUE.to_owned())
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        MessageId(
+            s.chars()
+                .filter(is_us_print_ascii)
+                .take(32)
+                .collect::<String>(),
+        )
+    }
+}
+
+impl Default for MessageId {
+    fn default() -> Self {
+        Self::nill()
     }
 }
 
